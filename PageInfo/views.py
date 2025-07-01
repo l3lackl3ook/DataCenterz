@@ -4,21 +4,262 @@ from django.db.models import Prefetch
 from django.conf import settings
 from django.db import connection
 from django.db.models import Count
+from django.utils import timezone
+from django.core.files import File
+from .seeding_utils import is_seeding
+from urllib.parse import unquote
+from urllib.parse import urlparse
+from django.http import HttpResponse
+from django.core.validators import URLValidator
+from django.core.exceptions import ValidationError
+from .forms import CommentDashboardForm  # ✅ อย่าลืม import
+from .models import FacebookComment, FBCommentDashboard
 from .models import PageGroup, PageInfo, FacebookPost, FollowerHistory
-from .forms import PageGroupForm, PageURLForm
+from .forms import PageGroupForm, PageURLForm, CommentDashboardForm
+from .fb_comment_info import run_fb_comment_scraper
 from .fb_page_info import PageInfo as FBPageInfo
 from .fb_page_info import PageFollowers  # ✅ เพิ่มบรรทัดนี้
 from .tiktok_page_info import get_tiktok_info  # แก้เป็น import get_tiktok_info
 from .ig_page_info import get_instagram_info
 from .lm8_page_info import get_lemon8_info  # ✅ เพิ่มบรรทัดนี้
 from .yt_page_info import get_youtube_info
-from .fb_post_info import run_fb_post_scraper  # ✅ ถูก: ใช้ชื่อไฟล์ที่แท้จริง
+from .fb_post import FBPostScraperAsync
+from .fb_video import FBVideoScraperAsync
+from .fb_comment_info import run_fb_comment_scraper as run_seeding_comment_scraper
+from .fb_comment import run_fb_comment_scraper as run_activity_comment_scraper
+from .fb_like import run_fb_like_scraper
+from .fb_share import run_fb_share_scraper
 from collections import Counter
 from collections import defaultdict
+import asyncio
 import calendar
 import re
 import os
 import json  # 👈 ต้อง import นี้
+
+async def run_activity_pipeline(post_url, dashboard):
+    # ✅ ดึงคอมเมนต์
+    comment_result = await run_fb_comment_scraper(post_url)
+    comments = comment_result.get("comments", [])
+
+    # ✅ ดึง likes
+    likes = await run_fb_like_scraper(post_url)
+
+    # ✅ ดึง shares
+    shares = await run_fb_share_scraper(post_url)
+
+    # ✅ สร้าง set ของชื่อเพื่อเช็คเร็ว
+    like_names = set(likes)
+    share_names = set(shares)
+
+    # ✅ เก็บใน DB พร้อมอัปเดต status
+    for c in comments:
+        author = c.get("author")
+        if not author:
+            continue
+
+        like_status = "liked" if author in like_names else "not_liked"
+        share_status = "shared" if author in share_names else "not_shared"
+
+        FacebookComment.objects.create(
+            post_url=post_url,
+            dashboard=dashboard,
+            author=author,
+            profile_img_url=c.get("profile_img_url"),
+            content=c.get("content"),
+            reaction=c.get("reaction"),
+            timestamp_text=c.get("timestamp_text"),
+            image_url=c.get("image_url"),
+            reply=c.get("reply"),
+            like_status=like_status,
+            share_status=share_status,
+        )
+
+def add_activity_dashboard(request):
+    if request.method == "POST":
+        post_url = request.POST.get("post_url")
+        dashboard_name = request.POST.get("dashboard_name")
+
+        if not post_url:
+            return HttpResponse("❌ ไม่พบ post_url", status=400)
+
+        # ✅ สร้าง dashboard ก่อน
+        dashboard = FBCommentDashboard.objects.create(
+            link_url=post_url,
+            dashboard_name=dashboard_name or post_url,
+            dashboard_type="activity"
+        )
+
+        # ✅ เรียกฟังก์ชัน pipeline
+        asyncio.run(run_activity_pipeline(post_url, dashboard))
+
+        return redirect(f"/comment-dashboard/?post_url={post_url}")
+
+def extract_post_id(url):
+    patterns = [
+        r'permalink/(\d+)',
+        r'posts/([a-zA-Z0-9]+)',
+        r'story_fbid=(\d+)',
+        r'/videos/(\d+)',
+        r'fbid=(\d+)',
+        r'comment_id=(\d+)'  # สำหรับคอมเมนต์ URL
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+def normalize_url(url):
+    return urlparse(url)._replace(query="", fragment="").geturl().rstrip('/')
+
+def comment_dashboard_view(request):
+    target_post_url = request.GET.get("post_url")
+
+    if not target_post_url or target_post_url == "None":
+        raw_url = request.GET.get("url", "")
+        target_post_url = unquote(raw_url)
+
+    if not target_post_url:
+        return HttpResponse("❌ ไม่พบ post_url", status=400)
+
+    dashboard = FBCommentDashboard.objects.filter(link_url__icontains=target_post_url).order_by("-created_at").first()
+
+    if not dashboard:
+        return HttpResponse("❌ ไม่พบ dashboard", status=404)
+
+    all_comments = FacebookComment.objects.filter(post_url=target_post_url).exclude(
+        timestamp_text__isnull=True).exclude(timestamp_text="").order_by("-created_at")
+
+    # เพิ่มค่า activity_comments สำหรับทั้ง seeding และ activity
+    activity_comments = all_comments
+
+    # ✅ ถ้าเป็น seeding dashboard
+    if dashboard.dashboard_type == "seeding":
+        seeding_comments = [c for c in all_comments if is_seeding(c.author)]
+        organic_comments = [c for c in all_comments if not is_seeding(c.author)]
+
+        context = {
+            "dashboard": dashboard,
+            "decoded_url": target_post_url,
+            "seeding_comments": seeding_comments,
+            "organic_comments": organic_comments,
+            "activity_comments": activity_comments,  # เพิ่ม activity_comments
+        }
+
+    # ✅ ถ้าเป็น activity dashboard
+    elif dashboard.dashboard_type == "activity":
+        liked_comments = [c for c in all_comments if c.like_status == "ถูกใจแล้ว"]
+        unliked_comments = [c for c in all_comments if c.like_status != "ถูกใจแล้ว"]
+        # เพิ่ม activity_comments ใน context
+        context = {
+            "dashboard": dashboard,
+            "decoded_url": target_post_url,
+            "comments": activity_comments,
+            "liked_comments": liked_comments,
+            "unliked_comments": unliked_comments,
+        }
+
+    else:
+        context = {
+            "dashboard": dashboard,
+            "decoded_url": target_post_url,
+        }
+
+    return render(request, "PageInfo/comment_dashboard.html", context)
+
+
+
+def add_comment_url(request):
+    if request.method == "POST":
+        link_url = request.POST.get("post_url")
+        dashboard_name = request.POST.get("dashboard_name") or extract_post_id(link_url)
+        dashboard_type = request.POST.get("dashboard_type") or "seeding"
+
+    elif request.method == "GET":
+        link_url = request.GET.get("url")
+        dashboard_name = extract_post_id(link_url) if link_url else None
+        dashboard_type = request.GET.get("dashboard_type") or "seeding"
+
+    else:
+        return redirect('index')
+
+    if not link_url:
+        return HttpResponse("❌ ไม่พบ URL", status=400)
+
+    validate = URLValidator()
+    try:
+        validate(link_url)
+    except ValidationError:
+        return HttpResponse("❌ URL ไม่ถูกต้อง", status=400)
+
+    normalized_link_url = normalize_url(link_url)
+
+    # ✅ สร้าง dashboard ก่อน
+    dashboard = FBCommentDashboard.objects.create(
+        link_url=normalized_link_url,
+        dashboard_name=dashboard_name[:255] if dashboard_name else "",
+        dashboard_type=dashboard_type,
+    )
+
+    if dashboard_type == "seeding":
+        # ✅ รัน seeding comment scraper
+        result = asyncio.run(run_seeding_comment_scraper(link_url))
+        comments = result.get("comments", [])
+        screenshot_path = result.get("post_screenshot_path")
+
+        for c in comments:
+            FacebookComment.objects.create(
+                post_url=normalized_link_url,
+                dashboard=dashboard,
+                author=c.get("author"),
+                profile_img_url=c.get("profile_img_url"),
+                content=c.get("content"),
+                reaction=c.get("reaction"),
+                timestamp_text=c.get("timestamp_text"),
+                image_url=c.get("image_url"),
+                reply=c.get("reply"),
+            )
+
+        # ✅ save screenshot ถ้ามี
+        if screenshot_path:
+            abs_path = os.path.join("media", screenshot_path)
+            if os.path.exists(abs_path):
+                with open(abs_path, "rb") as f:
+                    dashboard.screenshot_path.save(os.path.basename(abs_path), File(f), save=True)
+
+    elif dashboard_type == "activity":
+        # ✅ รัน activity comment scraper + like + share
+        result = asyncio.run(run_activity_comment_scraper(link_url))
+        comments = result.get("comments", [])  # 🔑 แก้ตรงนี้
+
+        likes = asyncio.run(run_fb_like_scraper(link_url))
+        shares = asyncio.run(run_fb_share_scraper(link_url))
+
+        like_names = set(likes)
+        share_names = set(shares)
+
+        for c in comments:
+            name = c.get("author")
+            FacebookComment.objects.create(
+                post_url=normalized_link_url,
+                dashboard=dashboard,
+                author=name,
+                profile_img_url=c.get("profile_img_url"),
+                content=c.get("content"),
+                reaction=c.get("reaction"),
+                timestamp_text=c.get("timestamp_text"),
+                image_url=c.get("image_url"),
+                reply=c.get("reply"),
+                like_status="ถูกใจแล้ว" if name in like_names else "ยังไม่ถูกใจ",
+                share_status="แชร์แล้ว" if name in share_names else "ยังไม่แชร์",
+            )
+
+    return redirect(f"/comment-dashboard/?post_url={normalized_link_url}")
+
+    return redirect('index')
+
+
 
 def get_pillar_summary_from_pages(page_ids):
     from django.db import connection
@@ -63,6 +304,15 @@ def clean_number(value):
     else:
         return 0
 
+async def run_fb_post_and_video_scraper(url, cookie_path, cutoff_dt):
+    posts_scraper = FBPostScraperAsync(cookie_file=cookie_path, headless=True, page_url=url, cutoff_dt=cutoff_dt)
+    videos_scraper = FBVideoScraperAsync(cookie_file=cookie_path, headless=True, page_url=url, cutoff_dt=cutoff_dt)
+
+    posts = await posts_scraper.run()
+    videos = await videos_scraper.run()
+
+    return (posts or []) + (videos or [])
+
 
 def add_page(request, group_id):
     group = PageGroup.objects.get(id=group_id)
@@ -95,19 +345,38 @@ def add_page(request, group_id):
                         cutoff_date = datetime.now() - timedelta(days=30)
                         cookie_path = os.path.join(settings.BASE_DIR, 'PageInfo', 'cookie.json')
 
-                        posts = run_fb_post_scraper(url, cookies_path=cookie_path, cutoff_dt=cutoff_date)
+                        posts = asyncio.run(run_fb_post_and_video_scraper(url, cookie_path, cutoff_date))
 
-                        for post in posts or []:  # เผื่อ posts เป็น None
-                            FacebookPost.objects.create(
-                                page=page_obj,
-                                post_id=post['post_id'],
-                                post_timestamp_dt=post['post_timestamp_dt'],
-                                post_timestamp_text=post['post_timestamp_text'],
-                                post_content=post['post_content'],
-                                post_imgs=post['post_imgs'],
-                                reactions=post['reactions'],
-                                comment_count=post['comment_count'],
-                                share_count=post['share_count']
+
+                        for post in posts or []:
+                            # รวมภาพทั้งหมด
+                            post_imgs = (post.get("post_imgs") or []) + (
+                                [post.get("video_thumbnail")] if post.get("video_thumbnail") else [])
+
+                            # ใช้ video_url แทน post_url ถ้าเป็นวิดีโอ
+                            post_url = post.get("video_url") if post.get("post_type") == "video" else post.get("post_url")
+
+
+                            # แก้ timezone warning
+                            post_timestamp_dt = post.get("post_timestamp_dt")
+                            if post_timestamp_dt and timezone.is_naive(post_timestamp_dt):
+                                post_timestamp_dt = timezone.make_aware(post_timestamp_dt)
+
+                            FacebookPost.objects.update_or_create(
+                                post_id=post["post_id"],
+                                defaults={
+                                    'page': page_obj,
+                                    'post_url': post_url,
+                                    'post_type': post["post_type"],
+                                    'post_timestamp_dt': post_timestamp_dt,
+                                    'post_timestamp_text': post.get('post_timestamp_text', ""),
+                                    'post_content': post.get('post_content', ""),
+                                    'post_imgs': post_imgs,
+                                    'reactions': post.get('reactions', {}),
+                                    'comment_count': post.get('comment_count', 0),
+                                    'share_count': post.get('share_count', 0),
+                                    'watch_count': post.get('watch_count'),
+                                }
                             )
                     except Exception as e:
                         print("❌ Error fetching posts:", e)
@@ -504,15 +773,21 @@ def group_detail(request, group_id):
     })
 
 
-
-
 def index(request):
     page_groups = PageGroup.objects.prefetch_related('pages')
-    total_groups = page_groups.count()  # นับจำนวนกลุ่มทั้งหมด
+    total_groups = page_groups.count()
+
+    comment_dashboards = FBCommentDashboard.objects.all().order_by('-created_at')
+    form = CommentDashboardForm()  # ✅ เพิ่มตรงนี้ด้วย
+
     return render(request, 'PageInfo/index.html', {
         'page_groups': page_groups,
-        'total_groups': total_groups,  # ส่งจำนวนทั้งหมดไป template
+        'total_groups': total_groups,
+        'comment_dashboards': comment_dashboards,
+        'form': form  # ✅ ส่ง form ไปด้วย
     })
+
+
 
 def sidebar_context(request):
     page_groups = PageGroup.objects.all()

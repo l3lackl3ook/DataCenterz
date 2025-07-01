@@ -22,16 +22,28 @@ class FBPostScraperAsync:
         self.cutoff_dt = cutoff_dt
         self.batch_size = batch_size
 
-        # JavaScript snippet to fetch posts (push all, let Python filter by cutoff)
+        # JavaScript snippet to fetch posts (push all, let Python filter by cutoff), now with improved thumbnail logic
         JS_FETCH_POSTS = r"""(cutoffMs) => {
             const results = [];
             let olderReached = false;
             const containers = document.querySelectorAll('div[data-pagelet^="TimelineFeedUnit_"]');
             for (const post of containers) {
-                const postLink = post.querySelector('a[href*="/posts/"]');
+                let thumbnails = null;
+                // If this is a video post, grab the inline thumbnail image
+                const postLink = post.querySelector('a[href*="/posts/"], a[href*="/videos/"]');
+                if (postLink && /\/videos\//.test(postLink.href)) {
+                    const img = post.querySelector(
+                        'div.x6s0dn4.x1ey2m1c.x9f619.x78zum5.xtijo5x.x1o0tod.xl56j7k.x10l6tqk.x13vifvy[data-visualcompletion="ignore"] img'
+                    );
+                    if (img && img.src) {
+                        thumbnails = [img.src];
+                    }
+                }
+                // (postLink is already defined above)
                 if (!postLink) continue;
-                const abbr = postLink.querySelector('abbr');
+                // extract epoch logic as before...
                 let epochMs = null;
+                const abbr = postLink.querySelector('abbr');
                 if (abbr && abbr.dataset && abbr.dataset.utime) {
                     epochMs = parseInt(abbr.dataset.utime, 10) * 1000;
                 } else {
@@ -87,8 +99,7 @@ class FBPostScraperAsync:
                 }
                 if (epochMs !== null) {
                     if (epochMs >= cutoffMs) {
-                        // Post is within cutoff window
-                        results.push({ id: postLink.href, epoch: epochMs });
+                        results.push({ id: postLink.href, epoch: epochMs, thumbnails });
                     } else {
                         olderReached = true;
                         continue;
@@ -178,8 +189,10 @@ class FBPostScraperAsync:
         digits = re.sub(r'[^\d]', '', t)
         return int(digits) if digits else 0
 
-    async def _get_post(self, page: Page, cutoff_dt: datetime, max_posts: int, seen_ids: set) -> Tuple[List[Tuple[str, datetime]], bool]:
-        batch: List[Tuple[str, datetime]] = []
+    async def _get_post(self, page: Page, cutoff_dt: datetime, max_posts: int, seen_ids: set) -> Tuple[List[Tuple[str, datetime, Optional[str]]], bool]:
+        import os
+        os.makedirs("screenshots", exist_ok=True)
+        batch: List[Tuple[str, datetime, Optional[str]]] = []
         cutoff_ms = 0 if cutoff_dt is None else int(cutoff_dt.timestamp() * 1000)
         older_than_cutoff = False
         empty_fetch_retries = 0
@@ -192,8 +205,10 @@ class FBPostScraperAsync:
 
         # Loop until we collect enough or hit older posts
         while len(batch) < max_posts and not older_than_cutoff:
-            # data = await page.evaluate(self.JS_FETCH_POSTS, cutoff_ms)
             raw = await page.evaluate(self.JS_FETCH_POSTS, cutoff_ms)
+            # Debug: print full HTML source of each TimelineFeedUnit container after fetch
+            containers = page.locator('div[data-pagelet^="TimelineFeedUnit_"]')
+
             data = raw.get("results", [])
             if raw.get("olderReached"):
                 older_than_cutoff = True
@@ -207,14 +222,32 @@ class FBPostScraperAsync:
                 else:
                     break
 
-            for entry in data:
+            # Scope thumbnails per container
+            for idx, entry in enumerate(data):
                 url = entry["id"]
                 dt_obj = datetime.fromtimestamp(entry["epoch"] / 1000)
+
+                # Initialize thumbnail from JS result
+                thumbnail = entry.get("thumbnails")
+
+                # If this is a video post and no thumbnail came from JS, look inside its own container
+                if '/videos/' in url and not thumbnail:
+                    container = containers.nth(idx)
+                    thumb_imgs = container.locator(
+                        'div.x6s0dn4.x1ey2m1c.x9f619.x78zum5.xtijo5x.x1o0tod.xl56j7k.x10l6tqk.x13vifvy img'
+                    )
+                    count_imgs = await thumb_imgs.count()
+
+                    if count_imgs:
+                        thumbs = [await thumb_imgs.nth(i).get_attribute('src') for i in range(count_imgs)]
+                        thumbnail = [src for src in thumbs if src]
+                        print(f"thumbnails: {thumbnail}")
+
                 if cutoff_dt and dt_obj < cutoff_dt:
                     older_than_cutoff = True
                     break
                 if url not in seen_ids:
-                    batch.append((url, dt_obj))
+                    batch.append((url, dt_obj, thumbnail))
                     seen_ids.add(url)
                     if len(batch) >= max_posts:
                         break
@@ -223,20 +256,39 @@ class FBPostScraperAsync:
                 break
 
             # Scroll and retry
-            # data_retry = await self._scroll_and_eval(page, cutoff_ms)
             raw_retry = await self._scroll_and_eval(page, cutoff_ms)
+            # Debug: print full HTML source of each TimelineFeedUnit container after scroll retry
+            containers = page.locator('div[data-pagelet^="TimelineFeedUnit_"]')
+
             data_retry = raw_retry.get("results", [])
             if raw_retry.get("olderReached"):
                 older_than_cutoff = True
-            # Merge retry results same as above
-            for entry in data_retry:
+            # Merge retry results same as above, scope thumbnails per container
+            for idx, entry in enumerate(data_retry):
                 url = entry["id"]
                 dt_obj = datetime.fromtimestamp(entry["epoch"] / 1000)
+
+                # Initialize thumbnail from JS result
+                thumbnail = entry.get("thumbnails")
+
+                # If this is a video post and no thumbnail came from JS, look inside its own container
+                if '/videos/' in url and not thumbnail:
+                    container = containers.nth(idx)
+                    thumb_imgs = container.locator(
+                        'div.x6s0dn4.x1ey2m1c.x9f619.x78zum5.xtijo5x.x1o0tod.xl56j7k.x10l6tqk.x13vifvy img'
+                    )
+                    count_imgs = await thumb_imgs.count()
+                    if count_imgs:
+                        thumbs = [await thumb_imgs.nth(i).get_attribute('src') for i in range(count_imgs)]
+                        thumbnail = [src for src in thumbs if src]
+                        print(f"thumbnails: {thumbnail}")
+
                 if cutoff_dt and dt_obj < cutoff_dt:
                     older_than_cutoff = True
                     break
+
                 if url not in seen_ids:
-                    batch.append((url, dt_obj))
+                    batch.append((url, dt_obj, thumbnail))
                     seen_ids.add(url)
                     if len(batch) >= max_posts:
                         break
@@ -253,7 +305,7 @@ class FBPostScraperAsync:
             await detail_page.goto(post_url)
 
             # Wait for the light‐mode container
-            await detail_page.wait_for_selector('.__fb-light-mode.x1n2onr6.x1vjfegm', timeout=10000)
+            await detail_page.wait_for_selector('.__fb-light-mode.x1n2onr6.x1vjfegm', timeout=20000)
             await detail_page.locator('.__fb-light-mode.x1n2onr6.x1vjfegm').first.scroll_into_view_if_needed()
             light_container = detail_page.locator('.__fb-light-mode.x1n2onr6.x1vjfegm').first
             try:
@@ -344,8 +396,15 @@ class FBPostScraperAsync:
                 share_count = 0
 
             # Extract just the ID portion from the URL
-            raw_id = post_url.split('/posts/')[1]
+            if '/posts/' in post_url:
+                raw_id = post_url.split('/posts/')[1]
+            elif '/videos/' in post_url:
+                raw_id = post_url.split('/videos/')[1]
+            else:
+                raw_id = post_url
             post_id = raw_id.split('?')[0]
+            # Determine post type
+            post_type = 'video' if '/videos/' in post_url else 'post'
 
             reactions = {}
             try:
@@ -394,6 +453,7 @@ class FBPostScraperAsync:
             return {
                 'post_url': post_url,
                 "post_id": post_id,
+                "post_type": post_type,
                 "post_timestamp_text": post_timestamp_text,
                 "post_timestamp_dt": post_timestamp_dt,
                 "post_content": post_content,
@@ -401,6 +461,211 @@ class FBPostScraperAsync:
                 "reactions": reactions,
                 "comment_count": comment_count,
                 "share_count": share_count,
+                # "comments": comments,
+            }
+
+        except Exception as e:
+            print(f"[get_post_detail] ERROR for {post_url}: {e}")
+            try:
+                await detail_page.close()
+            except:
+                pass
+            return None
+
+    async def _get_video_detail(self, context: BrowserContext, post_url: str, video_thumbnail: Optional[str]) -> Optional[dict]:
+        try:
+            # print(f"[get_post_detail] Opening detail page for: {post_url}")
+            detail_page = await context.new_page()
+            await detail_page.goto(post_url)
+            # Disable video autoplay
+            await detail_page.evaluate("""
+                document.querySelectorAll('video').forEach(v => {
+                    v.pause();
+                    v.autoplay = false;
+                });
+            """)
+
+            # Wait for the video feed container
+            await detail_page.wait_for_selector('#watch_feed .x1jx94hy.x78zum5.x5yr21d', timeout=10000)
+            light_container = detail_page.locator('#watch_feed .x1jx94hy.x78zum5.x5yr21d').first
+            try:
+                await light_container.wait_for(timeout=10000)
+            except Exception as e:
+                print(f"[get_post_detail] Timeout waiting for light_container on {post_url}: {e}")
+                await detail_page.close()
+                return None
+
+            # DEBUG: check for video link presence
+            const_count = await light_container.locator('a[href*="/videos/"]').count()
+            # print(f"[get_video_detail] video_link count: {const_count}")
+            if const_count == 0:
+                # print(f"[get_video_detail] No video link found on {post_url}")
+                pass
+            else:
+                video_link = light_container.locator('a[href*="/videos/"]').first
+                # print(f"[get_video_detail] Found video_link href: {await video_link.get_attribute('href')}")
+                await video_link.wait_for(state='visible', timeout=10000)
+                # DEBUG: force-hover with overlay hiding
+                await video_link.scroll_into_view_if_needed()
+                await detail_page.evaluate("""
+                    // Disable pointer-events on any overlay that might intercept
+                    document.querySelectorAll('div[role="banner"], div.x1gfrnbc').forEach(el => {
+                        el.style.pointerEvents = 'none';
+                    });
+                """)
+                try:
+                    await video_link.hover(timeout=5000, force=True)
+                    # print("[get_video_detail] Hover succeeded with force")
+                except Exception as e:
+                    print(f"[get_video_detail] Hover failed even with force: {e}")
+                await detail_page.wait_for_timeout(500)
+
+            # Select tooltip with a more general selector
+            tooltip_span = detail_page.locator('div[role="tooltip"] span.x193iq5w').first
+            try:
+                await tooltip_span.wait_for(timeout=10000)
+            except Exception as e:
+                print(f"[get_post_detail] Timeout waiting for tooltip_span on {post_url}: {e}")
+                await detail_page.close()
+                return None
+
+            post_timestamp_text = (await tooltip_span.text_content()).strip()
+            post_timestamp_dt = self._parse_thai_timestamp(post_timestamp_text)
+
+            # Extract story messages
+            # expand if needed
+            more_btn = light_container.locator('div.x1gslohp >> text="ดูเพิ่มเติม"')
+            if await more_btn.count():
+                await more_btn.first.click()
+                await detail_page.wait_for_timeout(500)
+
+            # find all the lines of text in the description region
+            message_elements = await light_container.locator(
+                'div.xjkvuk6.xuyqlj2.x1odjw0f >> div[dir="auto"]'
+            ).all()
+
+            texts = []
+            for elem in message_elements:
+                line = (await elem.inner_text()).strip()
+                if line:
+                    texts.append(line)
+            post_content = "\n".join(texts)
+
+            # Comment count and watch count (no share count for video posts)
+            comment_count = 0
+            watch_count = None
+            try:
+                stats_bar = light_container.locator(
+                    'div.x78zum5.x1iyjqo2.xs83m0k.x13a6bvl.xeuugli.x1n2onr6'
+                )
+                # Parse comment count
+                comment_elem = stats_bar.locator('div[role="button"] >> span:has-text("ความคิดเห็น")').first
+                if await comment_elem.count():
+                    raw = (await comment_elem.text_content()).strip()
+                    match = re.search(r'([\d\.,]+\s*(?:พัน|หมื่น|แสน|ล้าน)?)', raw)
+                    if match:
+                        comment_count = self._parse_thai_number(match.group(1))
+                # Parse watch count
+                watch_elem = stats_bar.locator('span:has-text("ดู")').first
+                if await watch_elem.count():
+                    raw_watch = (await watch_elem.text_content()).strip()
+                    wmatch = re.search(
+                        r'ดู\s*([\d\.,]+\s*(?:พัน|หมื่น|แสน|ล้าน)?)\s*ครั้ง',
+                        raw_watch
+                    )
+                    if wmatch:
+                        watch_count = self._parse_thai_number(wmatch.group(1))
+            except Exception:
+                comment_count = 0
+                watch_count = None
+
+            # Extract just the ID portion from the URL
+            if '/posts/' in post_url:
+                raw_id = post_url.split('/posts/')[1]
+            elif '/videos/' in post_url:
+                raw_id = post_url.split('/videos/')[1]
+            else:
+                raw_id = post_url
+            post_id = raw_id.split('?')[0].strip('/')
+            # Construct Facebook watch URL
+            video_url = f"https://www.facebook.com/watch/?v={post_id}"
+            # Determine post type
+            post_type = 'video' if '/videos/' in post_url else 'post'
+
+            reactions = {}
+            try:
+                # Disable any overlays that might intercept clicks (including download buttons)
+                await detail_page.evaluate("""
+                    document.querySelectorAll('div[role="banner"], div.x1gfrnbc, .fb_dl_spirit_btn').forEach(el => el.style.pointerEvents = 'none');
+                """)
+
+                # Ensure the reactions toolbar is in view
+                await detail_page.evaluate("""
+                    const selector = 'span[role="toolbar"][aria-label*="แสดงความรู้สึก"], span[role="toolbar"][aria-label*="ดูว่าใครบ้าง"]';
+                    document.querySelectorAll(selector).forEach(el => el.scrollIntoView({block: 'center', inline: 'center'}));
+                """)
+
+                # Try clicking the “Show reactions” button
+                toolbar = light_container.locator(
+                    'span[role="toolbar"][aria-label*="แสดงความรู้สึก"], span[role="toolbar"][aria-label*="ดูว่าใครบ้าง"]'
+                )
+                if await toolbar.count():
+                    await toolbar.first.scroll_into_view_if_needed()
+                    await toolbar.first.click(force=True)
+                    await detail_page.wait_for_timeout(500)
+
+                    # Fallback: try clicking the summary reactions count button
+                    count_buttons = detail_page.locator('div[role="button"][tabindex="0"] span[style*="--anchorName"]')
+                    if await count_buttons.count():
+                        await count_buttons.first.click(force=True)
+                        await detail_page.wait_for_timeout(500)
+
+                # 2) Wait for the reactions dialog (role="dialog") to appear
+                # More robust dialog locator via role
+                overlay = detail_page.get_by_role('dialog').first
+                await overlay.wait_for(state='visible', timeout=10_000)
+
+                # Wait for the specific element inside the overlay
+                target_elem = overlay.locator('.xf7dkkf.xv54qhq').first
+                await target_elem.wait_for(state='visible', timeout=10_000)
+
+                # Extract each reaction (except "ทั้งหมด")
+                reaction_tabs = overlay.locator('div[role="tab"]')
+                count_tabs = await reaction_tabs.count()
+                for i in range(count_tabs):
+                    tab = reaction_tabs.nth(i)
+                    # Derive reaction type from aria-label, e.g. 'ถูกใจ', 'รักเลย'
+                    aria = await tab.get_attribute('aria-label')
+                    label_match = None
+                    if aria:
+                        m = re.search(r'แสดง\s[\d,\.]+\sคนที่แสดงความรู้สึก\s“?\"?([^\"”]+)\"?\"?', aria)
+                        if m:
+                            label_match = m.group(1).strip()
+                    if not label_match or label_match == 'ทั้งหมด':
+                        continue
+                    label = label_match
+                    # Get the count from the span inside the tab
+                    count_text = (await tab.locator('span.x193iq5w').first.text_content()).strip()
+                    reactions[label] = self._parse_thai_number(count_text)
+
+            except Exception as exc:
+                print(f"[get_post_reactions] failed: {exc}")
+
+            # print(f"[get_post_detail] Successfully fetched details for {post_id}")
+            await detail_page.close()
+
+            return {
+                'post_url': post_url,
+                "post_id": post_id,
+                "post_type": post_type,
+                "post_timestamp_text": post_timestamp_text,
+                "post_timestamp_dt": post_timestamp_dt,
+                "post_content": post_content,
+                "video_thumbnail": video_thumbnail,
+                "video_url": video_url,
+                "reactions": reactions,
+                "comment_count": comment_count,
+                "watch_count": watch_count,
                 # "comments": comments,
             }
 
@@ -513,8 +778,11 @@ class FBPostScraperAsync:
     async def run(self) -> None:
         print("Starting scraper...")
         async with async_playwright() as pw:
-            launch_args = {"headless": self.headless}
-            self.browser = await pw.chromium.launch(**launch_args)
+            launch_args = {
+                "headless": self.headless,
+                # "args": ["--autoplay-policy=user-gesture-required"]
+            }
+            self.browser = await pw.chromium.launch(channel="chrome", **launch_args)
             print("Browser launched.")
             context_args = {
                 "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
@@ -584,12 +852,16 @@ class FBPostScraperAsync:
                     empty_batch_retries = 0
 
                     print(f"Found {len(batch_posts)} posts in batch {batch_index}.")
+                    # print("Post URLs and thumbnails in this batch:")
+                    # for url, dt_obj, thumbnail in batch_posts:
+                    #     print(f"  {url} \n-> thumbnails: {thumbnail}")
                     print("Getting post details for this batch...")
 
-                    # Process fetched posts...
+                    # Process fetched items (posts vs videos)...
                     tasks = [
-                        self._get_post_detail(self.context, post_url)
-                        for (post_url, _) in batch_posts
+                        self._get_video_detail(self.context, url, thumbnail) if '/videos/' in url
+                        else self._get_post_detail(self.context, url)
+                        for (url, dt_obj, thumbnail) in batch_posts
                     ]
                     batch_results = await asyncio.gather(*tasks)
                     for detail in batch_results:
@@ -635,7 +907,7 @@ def run_fb_post_scraper(url: str, cookies_path: str = 'cookie.json', cutoff_dt: 
 if __name__ == "__main__":
     scraper = FBPostScraperAsync(
         cookie_file="cookie.json",
-        headless=True,
+        headless=False,
         page_url="https://www.facebook.com/hartbeatfanpage",
         cutoff_dt=datetime(2025, 5, 1, 0, 0),
         # cutoff_dt= None,

@@ -4,6 +4,6 @@ echo "🚀 Installing Python dependencies..."
 pip install -r requirements.txt
 
 echo "🧩 Installing Playwright browsers..."
-playwright install
+npx playwright install --with-deps
 
 echo "✅ Done setting up."

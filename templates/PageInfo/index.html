@@ -710,6 +710,90 @@
       </div>
     </div>
 
+<!-- 🔶 Section: Create Comment Dashboard -->
+<div class="card p-4 mt-4">
+  <!-- หัวข้อ -->
+  <div class="d-flex justify-content-between align-items-center mb-3">
+    <h3 style="font-weight: 500; font-size: 24px;">Create Comment Dashboard</h3>
+  </div>
+
+  <!-- ฟอร์มกรอก URL + Dashboard Name + Dashboard Type -->
+  <form method="post" action="{% url 'add_comment_url' %}">
+    {% csrf_token %}
+    <div class="row g-3 align-items-center mb-3">
+
+      <!-- ช่องกรอกลิงก์โพสต์ -->
+      <div class="col-md-5">
+        <input type="text" name="post_url" class="form-control form-control-lg"
+          placeholder="ลิงก์โพสต์ Facebook เช่น https://www.facebook.com/...">
+      </div>
+
+      <!-- ช่องกรอกชื่อ Dashboard -->
+      <div class="col-md-3">
+        <input type="text" name="dashboard_name" class="form-control form-control-lg"
+          placeholder="ชื่อ Dashboard เช่น Lotus รีวิว">
+      </div>
+
+      <!-- เลือกประเภท Dashboard -->
+      <div class="col-md-3">
+        <select name="dashboard_type" class="form-select form-select-lg">
+          <option value="seeding" selected>Seeding Dashboard</option>
+          <option value="activity">Activity Dashboard</option>
+        </select>
+      </div>
+
+      <!-- ปุ่ม Submit -->
+      <div class="col-md-1 text-end">
+        <button type="submit" class="btn w-100"
+          style="background-color: #FF6801; color: white; border-radius: 8px; padding: 10px 16px;">
+          + Create
+        </button>
+      </div>
+
+    </div>
+  </form>
+</div>
+
+
+<!-- 🔷 Section: Table of Comment Dashboards -->
+<div class="card p-4 mt-3">
+  <h5 style="font-weight: 500; font-size: 18px; margin-bottom: 20px;">Comment Dashboard List</h5>
+
+  <div class="table-responsive">
+    <table class="table table-hover" style="border: 1px solid #E0E0E0; border-radius: 8px; overflow: hidden;">
+      <thead style="background-color: #F5F5F5; color: #424242; font-weight: 500; font-size: 15px;">
+        <tr>
+          <th style="padding: 16px;">Dashboard Name</th>
+          <th style="padding: 16px;">Post URL</th>
+          <th style="padding: 16px;">Created At</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for dashboard in comment_dashboards %}
+        <tr style="border-bottom: 1px solid #E0E0E0;">
+          <td style="padding: 16px;">
+            <a href="{% url 'comment_dashboard' %}?url={{ dashboard.link_url|urlencode }}" style="text-decoration: none; color: #000; font-weight: 500;">
+            {{ dashboard.dashboard_name|default:"(ไม่มีชื่อ)" }}
+            </a>
+          </td>
+          <td style="padding: 16px;">
+            <a href="{{ dashboard.link_url }}" target="_blank" style="text-decoration: none; color: #1877f2;">
+              {{ dashboard.link_url|truncatechars:70 }}
+            </a>
+          </td>
+          <td style="padding: 16px;">{{ dashboard.created_at|date:"d M Y H:i" }}</td>
+        </tr>
+        {% empty %}
+        <tr>
+          <td colspan="3" class="text-center text-muted py-4">ยังไม่มี Comment Dashboard ถูกเพิ่มเข้ามา</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+
   </div>
 </div>
 

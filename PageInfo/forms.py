@@ -1,5 +1,7 @@
 from django import forms
 from .models import PageGroup
+from .models import FBCommentDashboard
+
 
 class PageURLForm(forms.Form):
     PLATFORM_CHOICES = [
@@ -35,3 +37,8 @@ class PageGroupForm(forms.ModelForm):
                 'placeholder': 'Input Group Name'
             }),
         }
+
+class CommentDashboardForm(forms.ModelForm):
+    class Meta:
+        model = FBCommentDashboard
+        fields = ['dashboard_name', 'link_url']
